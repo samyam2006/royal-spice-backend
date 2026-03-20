@@ -25,9 +25,8 @@ const DAILY_BUDGET_LIMIT = 200;               // max API calls site-wide per day
 const ALLOWED_ORIGINS = [                     // your website domain(s)
   "http://localhost",
   "http://127.0.0.1",
-  // Add your live domain here, e.g.:
-  // "https://royalspicemd.com",
-  // "https://www.royalspicemd.com",
+  "https://royalspicerestaurant.com",
+  "https://www.royalspicerestaurant.com",
 ];
 
 // =============================================
