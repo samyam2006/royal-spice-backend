@@ -2,10 +2,9 @@
 // Keeps your Claude API key secure on the server side
 //
 // SETUP:
-//   1. npm init -y
-//   2. npm install express cors dotenv
-//   3. Create a .env file with: ANTHROPIC_API_KEY=sk-ant-...
-//   4. node server.js
+//   1. npm install
+//   2. Create a .env file with: ANTHROPIC_API_KEY=sk-ant-...
+//   3. node server.js
 //
 // The server runs on port 3001 by default.
 
@@ -16,8 +15,105 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
-app.use(express.json());
+// =============================================
+// PROTECTION CONFIG — tweak these as needed
+// =============================================
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 10;                    // max 10 requests per IP per window
+const MAX_CONVERSATION_TURNS = 6;             // max user messages per session
+const DAILY_BUDGET_LIMIT = 200;               // max API calls site-wide per day
+const ALLOWED_ORIGINS = [                     // your website domain(s)
+  "http://localhost",
+  "http://127.0.0.1",
+  // Add your live domain here, e.g.:
+  // "https://royalspicemd.com",
+  // "https://www.royalspicemd.com",
+];
+
+// =============================================
+// RATE LIMITER — per IP, in-memory
+// =============================================
+const ipHits = new Map();
+
+function rateLimit(req, res, next) {
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.ip;
+  const now = Date.now();
+
+  if (!ipHits.has(ip)) {
+    ipHits.set(ip, []);
+  }
+
+  const timestamps = ipHits.get(ip).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  ipHits.set(ip, timestamps);
+
+  if (timestamps.length >= RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      error: "Too many requests. Please try again in a few minutes.",
+    });
+  }
+
+  timestamps.push(now);
+  next();
+}
+
+// Clean up old IP entries every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, timestamps] of ipHits) {
+    const fresh = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) ipHits.delete(ip);
+    else ipHits.set(ip, fresh);
+  }
+}, 30 * 60 * 1000);
+
+// =============================================
+// DAILY BUDGET CAP — site-wide
+// =============================================
+let dailyCalls = 0;
+let dailyResetDate = new Date().toDateString();
+
+function budgetCheck(req, res, next) {
+  const today = new Date().toDateString();
+  if (today !== dailyResetDate) {
+    dailyCalls = 0;
+    dailyResetDate = today;
+  }
+
+  if (dailyCalls >= DAILY_BUDGET_LIMIT) {
+    return res.status(503).json({
+      error: "Our AI recommender has reached its daily limit. Please try again tomorrow, or call us at (410) 589-5166!",
+    });
+  }
+
+  next();
+}
+
+// =============================================
+// CORS — only allow your website
+// =============================================
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.some((allowed) => origin.startsWith(allowed))) {
+        return callback(null, true);
+      }
+      callback(new Error("Not allowed by CORS"));
+    },
+  })
+);
+
+app.use(express.json({ limit: "10kb" }));
+
+// =============================================
+// HEALTH CHECK
+// =============================================
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    dailyCallsRemaining: DAILY_BUDGET_LIMIT - dailyCalls,
+  });
+});
 
 // Full menu data so Claude has context for recommendations
 const MENU_CONTEXT = `
@@ -47,7 +143,7 @@ NEPALESE SPECIALTIES:
 - Chicken Choila $19.99 — BBQ chicken in ginger, garlic, onions, fenugreek seeds & mustard oil
 - Vegetable Momo $12.99 — Steamed dumplings filled with vegetables & spices
 - Chicken Momo $14.99 — Steamed dumplings filled with ground chicken & spices
-- C-Momo $15.99 — Chicken momo deep-fried and sautéed in tangy sauce
+- C-Momo $15.99 — Chicken momo deep-fried and sauteed in tangy sauce
 - Jhol Momo $15.99 — Chicken momo submerged in house-special tomato sauce (#1 Seller)
 - Lamb Sadeko $15.99 — Spiced lamb salad with mustard oil, onion & Nepali spices
 - Chicken Thali $23.99 — Nepali chicken curry, naan, rice, daal & vegetables on a silver platter
@@ -158,12 +254,29 @@ IMPORTANT NOTES:
 - Located in Linthicum Heights, MD near BWI airport
 `;
 
-app.post("/api/recommend", async (req, res) => {
+// =============================================
+// MAIN ENDPOINT
+// =============================================
+app.post("/api/recommend", rateLimit, budgetCheck, async (req, res) => {
   const { messages } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "messages array is required" });
   }
+
+  // Cap conversation length
+  const userMsgCount = messages.filter((m) => m.role === "user").length;
+  if (userMsgCount > MAX_CONVERSATION_TURNS) {
+    return res.status(400).json({
+      error: "You've reached the conversation limit. Please refresh to start a new chat!",
+    });
+  }
+
+  // Sanitize — only allow role and content fields, trim long messages
+  const cleanMessages = messages.slice(-MAX_CONVERSATION_TURNS * 2).map((m) => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: String(m.content || "").slice(0, 500),
+  }));
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -177,7 +290,7 @@ app.post("/api/recommend", async (req, res) => {
         model: "claude-sonnet-4-20250514",
         max_tokens: 500,
         system: MENU_CONTEXT,
-        messages: messages,
+        messages: cleanMessages,
       }),
     });
 
@@ -193,6 +306,9 @@ app.post("/api/recommend", async (req, res) => {
       .map((b) => b.text)
       .join("\n");
 
+    dailyCalls++;
+    console.log(`[${new Date().toISOString()}] API call #${dailyCalls}/${DAILY_BUDGET_LIMIT}`);
+
     res.json({ reply: text });
   } catch (err) {
     console.error("Server error:", err);
@@ -202,4 +318,7 @@ app.post("/api/recommend", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Royal Spice AI backend running on http://localhost:${PORT}`);
+  console.log(`Rate limit: ${RATE_LIMIT_MAX} requests per ${RATE_LIMIT_WINDOW_MS / 60000} min per IP`);
+  console.log(`Daily budget: ${DAILY_BUDGET_LIMIT} API calls`);
+  console.log(`Max conversation turns: ${MAX_CONVERSATION_TURNS}`);
 });
